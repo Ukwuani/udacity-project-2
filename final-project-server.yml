@@ -1,0 +1,203 @@
+Description: >
+    Udacity Project 2 2022 :: Udagram
+
+Parameters:
+    EnvironmentName:
+        Type: String
+        Description: Environment name
+    AmiPreference:
+        Type: AWS::EC2::Image::Id
+        Description: AMI should be an Ubuntu 18 ami
+    InstanceType:
+        Type: String
+        Description: InstanceType should have 2vCPUs 4GB Memory
+
+Resources:
+  # Role and policies
+    UdacityS3ReadOnlyEC2:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                        Service: "ec2.amazonaws.com"
+                    Action: "sts:AssumeRole"
+            Path: /
+            Policies:
+              - PolicyName: s3FullAccess
+                PolicyDocument:
+                    Version: 2012-10-17
+                    Statement:
+                      - Effect: Allow
+                        Action: "s3:GetObject"
+                        Resource: "*"
+                      - Effect: Allow
+                        Action: "s3:ListBucket"
+                        Resource: "*"
+
+    ProfileWithRoleForOurApp:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            Path: /
+            Roles:
+                - Ref: UdacityS3ReadOnlyEC2
+
+  # Create the bastion server
+    BastionServer:
+        Type: AWS::EC2::Instance
+        Properties:
+            ImageId: !Ref AmiPreference
+            InstanceType: t2.micro
+            UserData:
+                Fn::Base64: !Sub |
+                    #!/bin/bash
+                    apt-get update -y
+                    apt-get install apache2 -y
+                    systemctl start apache2.service
+                    cd /var/www/html
+                    echo "Udacity Demo Web (Bastion) Server Up and Running!" > index.html
+            SubnetId:
+                Fn::ImportValue:
+                    !Sub ${EnvironmentName}-PUB1-SN
+            IamInstanceProfile:
+                !Ref ProfileWithRoleForOurApp
+            SecurityGroupIds:
+              - Fn::GetAtt: [WebServerSecGrp,"GroupId"]
+            # Tags:
+            #   - Key: Name
+            #     Value: !Sub "${EnvironmentName}-Bastion-Server"
+
+  # Create Security Groups
+    WebServerSecGrp:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: Allow inbound requests on port 80 and unrestricted internet access to outbound request
+            VpcId:
+                Fn::ImportValue:
+                    !Sub "${EnvironmentName}-VPCID"
+            SecurityGroupIngress:
+              - IpProtocol: tcp
+                FromPort: 80
+                ToPort: 80
+                CidrIp: 0.0.0.0/0
+              - IpProtocol: tcp
+                FromPort: 22
+                ToPort: 22
+                CidrIp: 0.0.0.0/0
+            SecurityGroupEgress:
+              - IpProtocol: tcp
+                FromPort: 0
+                ToPort: 65535
+                CidrIp: 0.0.0.0/0
+            Tags:
+              - Key: Name
+                Value: !Sub ${EnvironmentName}-WEB-SG
+
+    LoadBalancerSecGrp:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: Allow http request to ours load balancer
+            SecurityGroupIngress:
+              - IpProtocol: tcp
+                FromPort: 80
+                ToPort: 80
+                CidrIp: 0.0.0.0/0
+            SecurityGroupEgress:
+              - IpProtocol: tcp
+                FromPort: 80
+                ToPort: 80
+                CidrIp: 0.0.0.0/0
+            VpcId:
+                Fn::ImportValue:
+                    !Sub "${EnvironmentName}-VPCID"
+            # Tags:
+            #   - Key: Name
+            #     Value: !Sub ${EnvironmentName}-LB-SG
+
+  # Create the launch configuration
+    WebAppLaunchConfiguration:
+        Type: AWS::AutoScaling::LaunchConfiguration
+        Properties:
+            LaunchConfigurationName: Web App LaunchConfiguration
+            InstanceType: !Ref InstanceType
+            ImageId: !Ref AmiPreference
+            IamInstanceProfile: !Ref ProfileWithRoleForOurApp
+            UserData:
+                Fn::Base64: !Sub |
+                    #!/bin/bash
+                    apt-get update -y
+                    apt-get install apache2 -y
+                    systemctl start apache2.service
+                    cd /var/www/html
+                    echo "It works! Udagram, Udacity! Yay!!" > index.html
+            SecurityGroups:
+              - Ref: WebServerSecGrp
+            BlockDeviceMappings:
+              - DeviceName: "/dev/sdk"
+                Ebs:
+                    VolumeSize: 10
+
+    WebAppAutoScaleGroup:
+        Type: AWS::AutoScaling::AutoScalingGroup
+        Properties:
+            LaunchConfigurationName: !Ref WebAppLaunchConfiguration
+            VPCZoneIdentifier:
+              - Fn::ImportValue: !Sub "${EnvironmentName}-PRI1-SN"
+              - Fn::ImportValue: !Sub "${EnvironmentName}-PRI2-SN"
+            MinSize: '2'
+            MaxSize: '4'
+            TargetGroupARNs:
+              - Ref: WebAppTargetGroup
+
+    WebAppLoadBalancer:
+        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        Properties:
+            Subnets:
+              - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+              - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+            SecurityGroups:
+              - Ref: LoadBalancerSecGrp
+
+  # Create Load Balancer Listener and Rules
+    LBListener:
+        Type: AWS::ElasticLoadBalancingV2::Listener
+        Properties:
+            DefaultActions:
+              - Type: forward
+                TargetGroupArn: !Ref WebAppTargetGroup
+            Protocol: HTTP
+            LoadBalancerArn: !Ref WebAppLoadBalancer
+            Port: 80
+    LBListenerRule:
+        Type: AWS::ElasticLoadBalancingV2::ListenerRule
+        Properties:
+            ListenerArn: !Ref LBListener
+            Actions:
+              - Type: forward
+                TargetGroupArn: !Ref WebAppTargetGroup
+            Conditions:
+              - Field: path-pattern
+                Values: [/]
+            Priority: 1
+
+  # Create the target group
+    WebAppTargetGroup:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        Properties:
+            HealthCheckIntervalSeconds: 30
+            HealthCheckPath: "/"
+            HealthCheckTimeoutSeconds: 8
+            HealthyThresholdCount: 2
+            UnhealthyThresholdCount: 5
+            Port: 80
+            Protocol: HTTP
+            VpcId:
+                Fn::ImportValue:
+                    Fn::Sub: "${EnvironmentName}-VPCID"
+
+Outputs:
+    LoadBalancerUrl:
+        Description: Load balancer DNS url reference
+        Value: !Join ["", ["http://", !GetAtt WebAppLoadBalancer.DNSName]]
